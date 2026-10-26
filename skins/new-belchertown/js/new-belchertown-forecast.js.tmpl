@@ -61,7 +61,7 @@ function forecast_payload_is_stale(data) {
 }
 
 function forecast_json_url(filename) {
-    return get_relative_url() + "/json/" + filename + "?_=" + Date.now();
+    return get_relative_url() + "/json/" + filename;
 }
 
 function forecast_clear_retry_timer() {
@@ -88,7 +88,9 @@ function forecast_schedule_retry(delayMs) {
 }
 
 function forecast_fetch_json(filename) {
-    return fetch(forecast_json_url(filename), {cache: "no-store"})
+    // "no-cache" always checks with the server but lets it answer 304 Not
+    // Modified, instead of downloading the whole file every time.
+    return fetch(forecast_json_url(filename), {cache: "no-cache"})
         .then(function(resp) {
             if (!resp.ok) {
                 throw new Error("HTTP error! Unable to load " + filename);

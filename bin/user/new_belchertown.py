@@ -7,6 +7,7 @@ Pat O'Brien, August 19, 2018
 uajqq, since 2025
 """
 
+import bisect
 import calendar
 import datetime
 import html
@@ -8970,10 +8971,23 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
     def run(self):
         """Main entry point for file generation."""
         self._series_cache = {}
+        self._json_cache = {}
         try:
             self._run()
         finally:
             self._series_cache = None
+            self._json_cache = None
+
+    def _load_json_for_run(self, file_path):
+        """Load a JSON file once per run. Callers must not modify the result."""
+        cache = getattr(self, "_json_cache", None)
+        if cache is None:
+            with open(file_path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        if file_path not in cache:
+            with open(file_path, "r", encoding="utf-8") as fh:
+                cache[file_path] = json.load(fh)
+        return cache[file_path]
 
     def _run(self):
         """Build and write the chart JSON files."""
@@ -9864,8 +9878,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             if not os.path.isfile(forecast_file):
                 return None
 
-            with open(forecast_file, "r", encoding="utf-8") as fh:
-                forecast_data = json.load(fh)
+            forecast_data = self._load_json_for_run(forecast_file)
 
             aqi_array = forecast_data.get("aqi") or []
             if not aqi_array:
@@ -9934,8 +9947,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             if not os.path.isfile(current_conditions_file):
                 return None
 
-            with open(current_conditions_file, "r", encoding="utf-8") as fh:
-                current_data = json.load(fh)
+            current_data = self._load_json_for_run(current_conditions_file)
 
             current_payload = (current_data.get("current") or [{}])[0] or {}
             point_ts = current_data.get("timestamp") or fallback_ts or int(time.time())
@@ -10139,11 +10151,10 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             for windDir, windSpeed in zip(windDir_vals, windSpeed_vals):
                 if windDir is not None and windSpeed is not None:
                     # Determine group index based on thresholds
-                    group_idx = 6  # Default to highest group
-                    for i, threshold in enumerate(thresholds):
-                        if windSpeed < threshold:
-                            group_idx = i
-                            break
+                    # (first threshold the speed is below; else the top group)
+                    group_idx = bisect.bisect_right(thresholds, windSpeed)
+                    if group_idx >= len(thresholds):
+                        group_idx = 6
 
                     dir_idx = int((windDir + 11.25) / 22.5) % 16
                     series_data[group_idx][dir_idx] += windSpeed
@@ -10885,12 +10896,14 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
         # forecast-backed AQI observations when available. This covers the
         # common case where the observation is intentionally not stored in the
         # archive database, but the value is present in forecast.json.
-        forecast_point = self._get_forecast_aqi_point(observation, end_ts)
-        if forecast_point is not None and not any(x is not None for x in obs_round_vt):
-            log.info(
-                f"Using forecast.json AQI fallback for observation '{observation}' after empty archive result"
-            )
-            return [forecast_point]
+        # Only read the fallback files when the archive gave nothing.
+        if observation in AQI_OBS_MAP and not any(x is not None for x in obs_round_vt):
+            forecast_point = self._get_forecast_aqi_point(observation, end_ts)
+            if forecast_point is not None:
+                log.info(
+                    f"Using forecast.json AQI fallback for observation '{observation}' after empty archive result"
+                )
+                return [forecast_point]
 
         time_ms = [_epoch_ms(x) for x in point_timestamp[0]]
         data = zip(time_ms, obs_round_vt)
