@@ -773,6 +773,11 @@ def _iso_to_epoch(value):
         return None
 
 
+def _epoch_ms(value):
+    """Convert epoch seconds to whole epoch milliseconds for chart JSON."""
+    return int(round(float(value) * 1000))
+
+
 def _write_json_file(file_path, payload):
     """Write JSON payload to disk, creating parent directory when needed."""
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -5216,6 +5221,137 @@ def build_almanac_template_context(almanac_obj, current_ts, has_extras=None, ima
     return context
 
 
+# Records that only cover days before today change once a day, so they are
+# kept between report runs instead of re-scanning the daily summary tables
+# every archive interval. One entry per database; replaced at midnight.
+_RECORDS_DAY_CACHE = {}
+
+
+def _records_day_cache(db_manager, day_start_epoch):
+    """Return the per-day records cache dict for this database."""
+    db_key = (getattr(db_manager, "database_name", None), db_manager.table_name)
+    entry = _RECORDS_DAY_CACHE.get(db_key)
+    if entry is None or entry["day"] != day_start_epoch:
+        entry = {"day": day_start_epoch, "values": {}}
+        _RECORDS_DAY_CACHE[db_key] = entry
+    return entry["values"]
+
+
+def _cached_record(cache, key, compute):
+    """Return cache[key], computing it first if needed. Errors are not cached."""
+    if key not in cache:
+        cache[key] = compute()
+    return cache[key]
+
+
+def _best_daily_sum_row(*rows):
+    """Return the (dateTime, sum) row with the largest sum.
+
+    Matches ORDER BY sum DESC: NULL sums lose, and earlier arguments win ties.
+    """
+    best = None
+    for row in rows:
+        if row is None:
+            continue
+        if best is None or (
+            row[1] is not None and (best[1] is None or row[1] > best[1])
+        ):
+            best = row
+    return best
+
+
+def _add_group_totals(totals, rows):
+    """Add (year, month, total) rows into a {(year, month): total} dict."""
+    for year, month, total in rows:
+        key = (year, month)
+        previous = totals.get(key)
+        if previous is None:
+            totals[key] = total
+        elif total is not None:
+            totals[key] = previous + total
+    return totals
+
+
+def _best_group_total(totals, round_digits=None):
+    """Return (key, total) with the largest total, or None when empty."""
+    best = None
+    for key, total in totals.items():
+        if best is None or (
+            total is not None and (best[1] is None or total > best[1])
+        ):
+            best = (key, total)
+    if best is not None and round_digits is not None and best[1] is not None:
+        best = (best[0], round(best[1], round_digits))
+    return best
+
+
+def _year_totals_from_month_totals(month_totals):
+    """Collapse {(year, month): total} into {year: total}."""
+    year_totals = {}
+    for (year, _month), total in month_totals.items():
+        previous = year_totals.get(year)
+        if previous is None:
+            year_totals[year] = total
+        elif total is not None:
+            year_totals[year] = previous + total
+    return year_totals
+
+
+class _RainStreakTracker:
+    """Track the longest runs of days with and without rain.
+
+    Rows are (dateTime, sum, count) from the rain daily summary, in date
+    order. A gap in days or a day with no records breaks both streaks.
+    """
+
+    __slots__ = (
+        "best_with",
+        "best_without",
+        "streak_with",
+        "streak_without",
+        "prev_day",
+    )
+
+    def __init__(self):
+        self.best_with = (0, 0)
+        self.best_without = (0, 0)
+        self.streak_with = 0
+        self.streak_without = 0
+        self.prev_day = None
+
+    def copy(self):
+        clone = _RainStreakTracker()
+        for name in self.__slots__:
+            setattr(clone, name, getattr(self, name))
+        return clone
+
+    def feed(self, row):
+        day_index = round(row[0] / 86400)
+        has_gap = self.prev_day is not None and (day_index - self.prev_day) != 1
+        has_count = len(row) > 2 and row[2] is not None and row[2] != 0
+
+        if has_gap or not has_count:
+            self.streak_with = 0
+            self.streak_without = 0
+
+        self.prev_day = day_index
+
+        if row[1] != 0:
+            self.streak_with += 1
+            self.streak_without = 0
+        else:
+            self.streak_without += 1
+            self.streak_with = 0
+
+        if self.streak_with > self.best_with[0]:
+            self.best_with = (self.streak_with, row[0])
+        if self.streak_without > self.best_without[0]:
+            self.best_without = (self.streak_without, row[0])
+
+    def result(self):
+        return self.best_with, self.best_without
+
+
 class getData(SearchList):
     """Collect all custom data and calculations, then return search list extension."""
 
@@ -5950,36 +6086,42 @@ class getData(SearchList):
             ORDER BY total {order} LIMIT 1;
         """
         
-        year_outTemp_max_range_query = wx_manager.getSql(
-            temp_range_sql.format(order="DESC"), (year_start_epoch, today_start_epoch)
+        # Per-day cache for records that only look at days before today.
+        records_day_cache = _records_day_cache(wx_manager, today_start_epoch)
+
+        # Every temperature-range window ends at the start of today, so the
+        # results only change once a day.
+        temp_range_periods = (
+            ("year", year_start_epoch),
+            ("month", month_start_epoch),
+            ("week", week_start_epoch),
+            ("yesterday", yesterday_start_epoch),
+            ("at", 0),
         )
-        year_outTemp_min_range_query = wx_manager.getSql(
-            temp_range_sql.format(order="ASC"), (year_start_epoch, today_start_epoch)
+
+        def _query_temp_ranges():
+            return {
+                (period_name, order): wx_manager.getSql(
+                    temp_range_sql.format(order=order),
+                    (period_start, today_start_epoch),
+                )
+                for period_name, period_start in temp_range_periods
+                for order in ("DESC", "ASC")
+            }
+
+        temp_range_rows = _cached_record(
+            records_day_cache, "outTemp_range", _query_temp_ranges
         )
-        month_outTemp_max_range_query = wx_manager.getSql(
-            temp_range_sql.format(order="DESC"), (month_start_epoch, today_start_epoch)
-        )
-        month_outTemp_min_range_query = wx_manager.getSql(
-            temp_range_sql.format(order="ASC"), (month_start_epoch, today_start_epoch)
-        )
-        week_outTemp_max_range_query = wx_manager.getSql(
-            temp_range_sql.format(order="DESC"), (week_start_epoch, today_start_epoch)
-        )
-        week_outTemp_min_range_query = wx_manager.getSql(
-            temp_range_sql.format(order="ASC"), (week_start_epoch, today_start_epoch)
-        )
-        yesterday_outTemp_max_range_query = wx_manager.getSql(
-            temp_range_sql.format(order="DESC"), (yesterday_start_epoch, today_start_epoch)
-        )
-        yesterday_outTemp_min_range_query = wx_manager.getSql(
-            temp_range_sql.format(order="ASC"), (yesterday_start_epoch, today_start_epoch)
-        )
-        at_outTemp_max_range_query = wx_manager.getSql(
-            temp_range_sql.format(order="DESC"), (0, today_start_epoch)
-        )
-        at_outTemp_min_range_query = wx_manager.getSql(
-            temp_range_sql.format(order="ASC"), (0, today_start_epoch)
-        )
+        year_outTemp_max_range_query = temp_range_rows[("year", "DESC")]
+        year_outTemp_min_range_query = temp_range_rows[("year", "ASC")]
+        month_outTemp_max_range_query = temp_range_rows[("month", "DESC")]
+        month_outTemp_min_range_query = temp_range_rows[("month", "ASC")]
+        week_outTemp_max_range_query = temp_range_rows[("week", "DESC")]
+        week_outTemp_min_range_query = temp_range_rows[("week", "ASC")]
+        yesterday_outTemp_max_range_query = temp_range_rows[("yesterday", "DESC")]
+        yesterday_outTemp_min_range_query = temp_range_rows[("yesterday", "ASC")]
+        at_outTemp_max_range_query = temp_range_rows[("at", "DESC")]
+        at_outTemp_min_range_query = temp_range_rows[("at", "ASC")]
 
         # Find the group_name for outTemp in database
         outTemp_unit = converter.group_unit_dict["group_temperature"]
@@ -6157,7 +6299,17 @@ class getData(SearchList):
         year_windrun_maxsum_query = _query_windrun_maxsum(
             "yearly", year_start_epoch, week_daily_stop_epoch
         )
-        at_windrun_maxsum_query = _query_windrun_maxsum("all-time")
+        # All-time = best day before today (cached daily) vs today so far.
+        at_windrun_maxsum_query = _best_daily_sum_row(
+            _cached_record(
+                records_day_cache,
+                "windrun_at",
+                lambda: _query_windrun_maxsum(
+                    "all-time", stop_epoch=today_start_epoch
+                ),
+            ),
+            _query_windrun_maxsum("today", start_epoch=today_start_epoch),
+        )
 
         week_windrun_maxsum = _convert_daily_summary_result(
             week_windrun_maxsum_query,
@@ -6186,11 +6338,26 @@ class getData(SearchList):
             at_windrun_maxsum_query, windrun_unit, "group_distance", "km"
         )
 
-        at_rainiest_day_sql = """
-            SELECT dateTime, sum FROM archive_day_rain
-            ORDER BY sum DESC LIMIT 1;
-        """
-        at_rainiest_day_query = wx_manager.getSql(at_rainiest_day_sql)
+        def _query_best_day_split(table, cache_key):
+            """Highest daily sum of all time: days before today come from the
+            per-day cache, then today's row is compared against it."""
+            before_today = _cached_record(
+                records_day_cache,
+                cache_key,
+                lambda: wx_manager.getSql(
+                    f"SELECT dateTime, sum FROM {table} "
+                    "WHERE dateTime < ? ORDER BY sum DESC LIMIT 1;",
+                    (today_start_epoch,),
+                ),
+            )
+            today = wx_manager.getSql(
+                f"SELECT dateTime, sum FROM {table} "
+                "WHERE dateTime >= ? ORDER BY sum DESC LIMIT 1;",
+                (today_start_epoch,),
+            )
+            return _best_daily_sum_row(before_today, today)
+
+        at_rainiest_day_query = _query_best_day_split("archive_day_rain", "rain_day_at")
         at_rainiest_day = _convert_daily_summary_result(
             at_rainiest_day_query, rain_unit, "group_rain", rain_round
         )
@@ -6211,21 +6378,13 @@ class getData(SearchList):
                 WHERE dateTime >= ? AND dateTime < ?
                 GROUP BY month ORDER BY total DESC LIMIT 1;
             """
-            at_rainiest_month_sql = """
-                SELECT strftime('%m', datetime(dateTime, 'unixepoch', 'localtime')) AS month, strftime('%Y', datetime(dateTime, 'unixepoch', 'localtime')) AS year, SUM(sum) AS total
-                FROM archive_day_rain
-                GROUP BY month, year ORDER BY total DESC LIMIT 1;
-            """
-            year_rain_data_sql = """
-                SELECT dateTime, sum, count FROM archive_day_rain
+            month_totals_sql = """
+                SELECT strftime('%Y', datetime(dateTime, 'unixepoch', 'localtime')) AS year, strftime('%m', datetime(dateTime, 'unixepoch', 'localtime')) AS month, SUM(sum) AS total
+                FROM {table}
                 WHERE dateTime >= ? AND dateTime < ?
-                ORDER BY dateTime;
+                GROUP BY year, month;
             """
-            at_rain_highest_year_sql = """
-                SELECT strftime('%Y', datetime(dateTime, 'unixepoch', 'localtime')) AS year, SUM(sum) AS total
-                FROM archive_day_rain
-                GROUP BY year ORDER BY total DESC LIMIT 1;
-            """
+            month_totals_round = None
         elif driver == "weedb.mysql":
             year_rainiest_month_sql = """
                 SELECT FROM_UNIXTIME(dateTime, '%%m') AS month, ROUND(SUM(sum), 2) AS total
@@ -6233,21 +6392,51 @@ class getData(SearchList):
                 WHERE dateTime >= ? AND dateTime < ?
                 GROUP BY month ORDER BY total DESC LIMIT 1;
             """
-            at_rainiest_month_sql = """
-                SELECT FROM_UNIXTIME(dateTime, '%%m') AS month, FROM_UNIXTIME(dateTime, '%%Y') AS year, ROUND(SUM(sum), 2) AS total
-                FROM archive_day_rain
-                GROUP BY month, year ORDER BY total DESC LIMIT 1;
-            """
-            year_rain_data_sql = """
-                SELECT dateTime, ROUND(sum, 2), count FROM archive_day_rain
+            month_totals_sql = """
+                SELECT FROM_UNIXTIME(dateTime, '%%Y') AS year, FROM_UNIXTIME(dateTime, '%%m') AS month, SUM(sum) AS total
+                FROM {table}
                 WHERE dateTime >= ? AND dateTime < ?
-                ORDER BY dateTime;
+                GROUP BY year, month;
             """
-            at_rain_highest_year_sql = """
-                SELECT FROM_UNIXTIME(dateTime, '%%Y') AS year, ROUND(SUM(sum), 2) AS total
-                FROM archive_day_rain
-                GROUP BY year ORDER BY total DESC LIMIT 1;
+            month_totals_round = 2
+
+        def _query_all_time_month_and_year(table, cache_key):
+            """Best calendar month and best year of all time for a summed
+            observation. Month totals for days before today are cached daily;
+            today's row is added on top each run.
+
+            Returns (month_row, year_row) shaped like the old queries:
+            (month, year, total) and (year, total), or None when empty.
             """
+            sql = month_totals_sql.format(table=table)
+            before_today = _cached_record(
+                records_day_cache,
+                cache_key,
+                lambda: _add_group_totals(
+                    {}, wx_manager.genSql(sql, (0, today_start_epoch))
+                ),
+            )
+            month_totals = _add_group_totals(
+                dict(before_today),
+                wx_manager.genSql(sql, (today_start_epoch, next_year_start_epoch)),
+            )
+
+            best_month = _best_group_total(month_totals, month_totals_round)
+            month_row = (
+                None
+                if best_month is None
+                else (best_month[0][1], best_month[0][0], best_month[1])
+            )
+
+            best_year = _best_group_total(
+                _year_totals_from_month_totals(month_totals), month_totals_round
+            )
+            year_row = None if best_year is None else (best_year[0], best_year[1])
+            return month_row, year_row
+
+        at_rainiest_month_query, at_rain_highest_year_query = (
+            _query_all_time_month_and_year("archive_day_rain", "rain_months_at")
+        )
 
         # Rainiest month
         year_rainiest_month_query = wx_manager.getSql(
@@ -6279,7 +6468,6 @@ class getData(SearchList):
         ]
 
         # All time rainiest month
-        at_rainiest_month_query = wx_manager.getSql(at_rainiest_month_sql)
         if at_rainiest_month_query is not None and len(at_rainiest_month_query) >= 3:
             at_rainiest_month_tuple = (at_rainiest_month_query[2], rain_unit, "group_rain")
             at_rainiest_month_converted = (
@@ -6299,7 +6487,6 @@ class getData(SearchList):
         ]
 
         # All time rainiest year
-        at_rain_highest_year_query = wx_manager.getSql(at_rain_highest_year_sql)
         if at_rain_highest_year_query is not None and len(at_rain_highest_year_query) >= 2:
             at_rain_highest_year_tuple = (
                 at_rain_highest_year_query[1],
@@ -6352,11 +6539,9 @@ class getData(SearchList):
                     locale.format_string("%.2f", 0),
                 ]
 
-            at_sunniest_day_sql = """
-                SELECT dateTime, sum FROM archive_day_sunshineDur
-                ORDER BY sum DESC LIMIT 1;
-            """
-            at_sunniest_day_query = wx_manager.getSql(at_sunniest_day_sql)
+            at_sunniest_day_query = _query_best_day_split(
+                "archive_day_sunshineDur", "sunshineDur_day_at"
+            )
             if at_sunniest_day_query is not None and len(at_sunniest_day_query) >= 2:
                 at_sunniest_day_tuple = (
                     at_sunniest_day_query[1],
@@ -6388,16 +6573,6 @@ class getData(SearchList):
                     WHERE dateTime >= ? AND dateTime < ?
                     GROUP BY month ORDER BY total DESC LIMIT 1;
                 """
-                at_sunniest_month_sql = """
-                    SELECT strftime('%m', datetime(dateTime, 'unixepoch', 'localtime')) AS month, strftime('%Y', datetime(dateTime, 'unixepoch', 'localtime')) AS year, SUM(sum) AS total
-                    FROM archive_day_sunshineDur
-                    GROUP BY month, year ORDER BY total DESC LIMIT 1;
-                """
-                at_sunshineDur_highest_year_sql = """
-                    SELECT strftime('%Y', datetime(dateTime, 'unixepoch', 'localtime')) AS year, SUM(sum) AS total
-                    FROM archive_day_sunshineDur
-                    GROUP BY year ORDER BY total DESC LIMIT 1;
-                """
             elif driver == "weedb.mysql":
                 year_sunniest_month_sql = """
                     SELECT FROM_UNIXTIME(dateTime, '%%m') AS month, ROUND(SUM(sum), 2) AS total
@@ -6405,16 +6580,12 @@ class getData(SearchList):
                     WHERE dateTime >= ? AND dateTime < ?
                     GROUP BY month ORDER BY total DESC LIMIT 1;
                 """
-                at_sunniest_month_sql = """
-                    SELECT FROM_UNIXTIME(dateTime, '%%m') AS month, FROM_UNIXTIME(dateTime, '%%Y') AS year, ROUND(SUM(sum), 2) AS total
-                    FROM archive_day_sunshineDur
-                    GROUP BY month, year ORDER BY total DESC LIMIT 1;
-                """
-                at_sunshineDur_highest_year_sql = """
-                    SELECT FROM_UNIXTIME(dateTime, '%%Y') AS year, ROUND(SUM(sum), 2) AS total
-                    FROM archive_day_sunshineDur
-                    GROUP BY year ORDER BY total DESC LIMIT 1;
-                """
+
+            at_sunniest_month_query, at_sunshineDur_highest_year_query = (
+                _query_all_time_month_and_year(
+                    "archive_day_sunshineDur", "sunshineDur_months_at"
+                )
+            )
 
             year_sunniest_month_query = wx_manager.getSql(
                 year_sunniest_month_sql, (year_start_epoch, next_year_start_epoch)
@@ -6439,7 +6610,6 @@ class getData(SearchList):
             else:
                 year_sunniest_month = ["N/A", 0.0]
 
-            at_sunniest_month_query = wx_manager.getSql(at_sunniest_month_sql)
             if at_sunniest_month_query is not None and len(at_sunniest_month_query) >= 3:
                 at_sunniest_month_tuple = (
                     at_sunniest_month_query[2],
@@ -6458,9 +6628,6 @@ class getData(SearchList):
             else:
                 at_sunniest_month = ["N/A", 0.0]
 
-            at_sunshineDur_highest_year_query = wx_manager.getSql(
-                at_sunshineDur_highest_year_sql
-            )
             if at_sunshineDur_highest_year_query is not None and len(at_sunshineDur_highest_year_query) >= 2:
                 at_sunshineDur_highest_year_tuple = (
                     at_sunshineDur_highest_year_query[1],
@@ -6492,88 +6659,68 @@ class getData(SearchList):
             at_sunniest_month = ["N/A", 0.0]
             at_sunshineDur_highest_year = ["N/A", 0.0]
 
-        # Consecutive days with/without rainfall (best streak in each period window).
-        period_rain_data_sql = """
+        # Consecutive days with/without rainfall (best streak in each period
+        # window). One ordered pass over the rain daily summary feeds every
+        # window. Days before today are cached once a day; the year and
+        # all-time windows then carry on with today's row each run.
+        rain_streak_sql = """
             SELECT dateTime, ROUND(sum, 2), count
             FROM archive_day_rain
             WHERE dateTime >= ? AND dateTime < ?
             ORDER BY dateTime;
         """
+        streak_window_starts = (
+            ("year", year_start_epoch),
+            ("month", month_start_epoch),
+            ("week", week_start_epoch),
+            ("yesterday", yesterday_start_epoch),
+            ("at", 0),
+        )
 
-        def _compute_consecutive_rain_streaks(rows):
-            best_with = (0, 0)
-            best_without = (0, 0)
-            streak_with = 0
-            streak_without = 0
-            prev_day = None
+        def _query_streaks_before_today():
+            trackers = {name: _RainStreakTracker() for name, _ in streak_window_starts}
+            for row in wx_manager.genSql(rain_streak_sql, (0, today_start_epoch)):
+                for name, window_start in streak_window_starts:
+                    if row[0] >= window_start:
+                        trackers[name].feed(row)
+            return trackers
 
-            for row in rows:
-                day_index = round((row[0] / 86400))
-                has_gap = prev_day is not None and (day_index - prev_day) != 1
-                has_count = len(row) > 2 and row[2] is not None and row[2] != 0
+        streaks_before_today = _cached_record(
+            records_day_cache, "rain_streaks", _query_streaks_before_today
+        )
 
-                if has_gap or not has_count:
-                    streak_with = 0
-                    streak_without = 0
-
-                prev_day = day_index
-
-                if row[1] != 0:
-                    streak_with += 1
-                    streak_without = 0
-                else:
-                    streak_without += 1
-                    streak_with = 0
-
-                if streak_with > best_with[0]:
-                    best_with = (streak_with, row[0])
-                if streak_without > best_without[0]:
-                    best_without = (streak_without, row[0])
-
-            return best_with, best_without
+        # The year and all-time windows include today; the others end at the
+        # start of today.
+        year_tracker = streaks_before_today["year"].copy()
+        at_tracker = streaks_before_today["at"].copy()
+        for row in wx_manager.genSql(
+            rain_streak_sql, (today_start_epoch, next_year_start_epoch)
+        ):
+            year_tracker.feed(row)
+            at_tracker.feed(row)
 
         def _normalize_streak_result(streak_pair):
             if streak_pair[0] > 0:
                 return [int(streak_pair[0]), int(streak_pair[1])]
             return [0, calendar.timegm(time.gmtime())]
 
-        year_streaks = _compute_consecutive_rain_streaks(
-            wx_manager.genSql(
-                year_rain_data_sql, (year_start_epoch, next_year_start_epoch)
-            )
-        )
+        year_streaks = year_tracker.result()
         year_days_with_rain = _normalize_streak_result(year_streaks[0])
         year_days_without_rain = _normalize_streak_result(year_streaks[1])
 
-        month_streaks = _compute_consecutive_rain_streaks(
-            wx_manager.genSql(
-                period_rain_data_sql, (month_start_epoch, today_start_epoch)
-            )
-        )
+        month_streaks = streaks_before_today["month"].result()
         month_days_with_rain = _normalize_streak_result(month_streaks[0])
         month_days_without_rain = _normalize_streak_result(month_streaks[1])
 
-        week_streaks = _compute_consecutive_rain_streaks(
-            wx_manager.genSql(
-                period_rain_data_sql, (week_start_epoch, today_start_epoch)
-            )
-        )
+        week_streaks = streaks_before_today["week"].result()
         week_days_with_rain = _normalize_streak_result(week_streaks[0])
         week_days_without_rain = _normalize_streak_result(week_streaks[1])
 
-        yesterday_streaks = _compute_consecutive_rain_streaks(
-            wx_manager.genSql(
-                period_rain_data_sql, (yesterday_start_epoch, today_start_epoch)
-            )
-        )
+        yesterday_streaks = streaks_before_today["yesterday"].result()
         yesterday_days_with_rain = _normalize_streak_result(yesterday_streaks[0])
         yesterday_days_without_rain = _normalize_streak_result(yesterday_streaks[1])
 
-        at_streaks = _compute_consecutive_rain_streaks(
-            wx_manager.genSql(
-                "SELECT dateTime, ROUND(sum, 2), count FROM archive_day_rain ORDER BY dateTime;"
-            )
-        )
+        at_streaks = at_tracker.result()
         at_days_with_rain = _normalize_streak_result(at_streaks[0])
         at_days_without_rain = _normalize_streak_result(at_streaks[1])
 
@@ -8789,8 +8936,47 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
         db_binder:        An instance of weewx.manager.DBBinder from which the data should be extracted
     """
 
+    def _get_series_cached(
+        self, obs_type, timespan, archive, aggregate_type=None, aggregate_interval=None
+    ):
+        """weewx.xtypes.get_series(), memoised for the current run.
+
+        The same series often appears in several charts (home page and charts
+        page). Callers append to the returned lists, so each call gets its own
+        copies.
+        """
+        cache = getattr(self, "_series_cache", None)
+        if cache is None:
+            return weewx.xtypes.get_series(
+                obs_type, timespan, archive, aggregate_type, aggregate_interval
+            )
+
+        key = (
+            id(archive),
+            obs_type,
+            timespan.start,
+            timespan.stop,
+            aggregate_type,
+            aggregate_interval,
+        )
+        if key not in cache:
+            cache[key] = weewx.xtypes.get_series(
+                obs_type, timespan, archive, aggregate_type, aggregate_interval
+            )
+        return tuple(
+            weewx.units.ValueTuple(list(vt[0]), vt[1], vt[2]) for vt in cache[key]
+        )
+
     def run(self):
         """Main entry point for file generation."""
+        self._series_cache = {}
+        try:
+            self._run()
+        finally:
+            self._series_cache = None
+
+    def _run(self):
+        """Build and write the chart JSON files."""
 
         legacy_chart_config_path = os.path.join(
             self.config_dict["WEEWX_ROOT"],
@@ -9631,12 +9817,14 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
 
             # Write the output to the JSON file
             with open(json_filename, mode="w", encoding="utf-8") as jf:
-                jf.write(json.dumps(output[chart_group], indent=4))
+                json.dump(output[chart_group], jf, separators=(",", ":"))
 
-        # Save the charts.conf to a json file for future debugging.
-        chart_json_filename = html_dest_dir + "/charts.json"
-        with open(chart_json_filename, mode="w", encoding="utf-8") as cjf:
-            cjf.write(json.dumps(self.chart_dict, indent=4))
+        # Save the charts.conf to a json file for debugging. Only needed when
+        # WeeWX debug is on, so skip the write on normal report cycles.
+        if to_int(self.config_dict.get("debug", 0)) >= 1:
+            chart_json_filename = html_dest_dir + "/charts.json"
+            with open(chart_json_filename, mode="w", encoding="utf-8") as cjf:
+                cjf.write(json.dumps(self.chart_dict, indent=4))
 
     def _get_forecast_aqi_point(self, observation, fallback_ts=None):
         """Return a single [timestamp_ms, value] point for AQI observations
@@ -9908,7 +10096,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             # Get the selected direction and speed observations.
             timespan = TimeSpan(start_ts, end_ts)
 
-            (time_start_vt, time_stop_vt, windDir_vt) = weewx.xtypes.get_series(
+            (time_start_vt, time_stop_vt, windDir_vt) = self._get_series_cached(
                 wind_dir_obs,
                 timespan,
                 archive,
@@ -9917,7 +10105,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             )
             windDir_vals = list(windDir_vt[0])
 
-            (time_start_vt, time_stop_vt, windSpeed_vt) = weewx.xtypes.get_series(
+            (time_start_vt, time_stop_vt, windSpeed_vt) = self._get_series_cached(
                 wind_obs,
                 timespan,
                 archive,
@@ -10009,7 +10197,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             # Get min values
             aggregate_type = "min"
             try:
-                (time_start_vt, time_stop_vt, obs_vt) = weewx.xtypes.get_series(
+                (time_start_vt, time_stop_vt, obs_vt) = self._get_series_cached(
                     obs_lookup,
                     TimeSpan(start_ts, end_ts),
                     archive,
@@ -10036,7 +10224,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             # Get max values
             aggregate_type = "max"
             try:
-                (time_start_vt, time_stop_vt, obs_vt) = weewx.xtypes.get_series(
+                (time_start_vt, time_stop_vt, obs_vt) = self._get_series_cached(
                     obs_lookup,
                     TimeSpan(start_ts, end_ts),
                     archive,
@@ -10063,7 +10251,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             # Get avg values
             aggregate_type = "avg"
             try:
-                (time_start_vt, time_stop_vt, obs_vt) = weewx.xtypes.get_series(
+                (time_start_vt, time_stop_vt, obs_vt) = self._get_series_cached(
                     obs_lookup,
                     TimeSpan(start_ts, end_ts),
                     archive,
@@ -10091,7 +10279,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             obs_unit_label = skin_dict["Units"]["Labels"].get(obs_unit, "")
 
             # Convert to millis and zip all together
-            time_ms = [float(x) * 1000 for x in time_start_vt[0]]
+            time_ms = [_epoch_ms(x) for x in time_start_vt[0]]
             output_data = list(zip(time_ms, min_obs_vt[0], max_obs_vt[0], avg_obs_vt[0]))
 
             data = {
@@ -10123,7 +10311,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             # Get min values
             obs_lookup = "windSpeed"
             try:
-                (time_start_vt, time_stop_vt, obs_vt) = weewx.xtypes.get_series(
+                (time_start_vt, time_stop_vt, obs_vt) = self._get_series_cached(
                     obs_lookup,
                     TimeSpan(start_ts, end_ts),
                     archive,
@@ -10150,7 +10338,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             # Get max values
             obs_lookup = "windGust"
             try:
-                (time_start_vt, time_stop_vt, obs_vt) = weewx.xtypes.get_series(
+                (time_start_vt, time_stop_vt, obs_vt) = self._get_series_cached(
                     obs_lookup,
                     TimeSpan(start_ts, end_ts),
                     archive,
@@ -10178,7 +10366,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             obs_unit_label = skin_dict["Units"]["Labels"].get(obs_unit, "")
 
             # Convert to millis and zip all together
-            time_ms = [float(x) * 1000 for x in time_start_vt[0]]
+            time_ms = [_epoch_ms(x) for x in time_start_vt[0]]
             output_data = zip(time_ms, min_obs_vt[0], max_obs_vt[0])
 
             data = {
@@ -10198,7 +10386,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
 
             # Fetch wind speed (windSpeed or windGust based on wind_obs option)
             try:
-                (time_start_vt, time_stop_vt, windSpeed_vt) = weewx.xtypes.get_series(
+                (time_start_vt, time_stop_vt, windSpeed_vt) = self._get_series_cached(
                     wind_obs,
                     timespan,
                     archive,
@@ -10234,7 +10422,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             ms_converter = weewx.units.Converter({"group_speed": "meter_per_second"})
             if aggregate_interval and aggregate_type != "max":
                 try:
-                    (_, _, windSpeed_max_vt) = weewx.xtypes.get_series(
+                    (_, _, windSpeed_max_vt) = self._get_series_cached(
                         wind_obs,
                         timespan,
                         archive,
@@ -10260,7 +10448,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             else:
                 winddir_agg_type = aggregate_type
             try:
-                (_, _, windDir_vt) = weewx.xtypes.get_series(
+                (_, _, windDir_vt) = self._get_series_cached(
                     "windDir",
                     timespan,
                     archive,
@@ -10275,7 +10463,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
                 else:
                     winddir_agg_type = "avg" if aggregate_interval else aggregate_type
                 try:
-                    (_, _, windDir_vt) = weewx.xtypes.get_series(
+                    (_, _, windDir_vt) = self._get_series_cached(
                         "windDir",
                         timespan,
                         archive,
@@ -10286,7 +10474,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
                     # Second fallback: avg
                     winddir_agg_type = "avg" if aggregate_interval else aggregate_type
                     try:
-                        (_, _, windDir_vt) = weewx.xtypes.get_series(
+                        (_, _, windDir_vt) = self._get_series_cached(
                             "windDir",
                             timespan,
                             archive,
@@ -10303,7 +10491,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             windDir_vals = list(windDir_vt[0])
 
             # Convert timestamps to milliseconds
-            time_ms = [float(x) * 1000 for x in time_start_vt[0]]
+            time_ms = [_epoch_ms(x) for x in time_start_vt[0]]
 
             # Wind speed pairs for the line series: [ts_ms, display_speed]
             windspeed_data = [
@@ -10572,9 +10760,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
 
             # If the values are to be mirrored, we need to make them negative
             if mirrored_value:
-                for i in obsvalues:
-                    if i is not None:
-                        i = -i
+                obsvalues = [-x if x is not None else None for x in obsvalues]
 
             # Return a dict which has the value for if we need to add labels
             # from sql or not.
@@ -10594,7 +10780,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
 
         # Begin standard observation lookups
         try:
-            (time_start_vt, time_stop_vt, obs_vt) = weewx.xtypes.get_series(
+            (time_start_vt, time_stop_vt, obs_vt) = self._get_series_cached(
                 obs_lookup,
                 TimeSpan(start_ts, end_ts),
                 archive,
@@ -10706,7 +10892,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             )
             return [forecast_point]
 
-        time_ms = [float(x) * 1000 for x in point_timestamp[0]]
+        time_ms = [_epoch_ms(x) for x in point_timestamp[0]]
         data = zip(time_ms, obs_round_vt)
 
         return data
